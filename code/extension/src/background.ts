@@ -34,6 +34,7 @@ function isTruthy<T>(value: T): value is NonNullable<T> {
 
 const RELAY_HOST = '127.0.0.1'
 const RELAY_PORT = Number(process.env.PLAYWRITER_PORT) || 19988
+const WEBSOCKET_KEEPALIVE_INTERVAL_MS = 2000
 
 // CDP commands that should return near-instantly on a healthy tab. If a tab is
 // frozen/hibernated (e.g. Ghost Browser suspended tabs), chrome.debugger.sendCommand
@@ -81,6 +82,34 @@ async function sendCommandWithTimeout(
       clearTimeout(timeoutId)
     }
   }
+}
+
+// Chrome 的 debugger API 在某些已有账号/扩展较多的配置里可能既不 resolve 也不 reject。
+// 给这类 Promise 加边界，同时消费它的后续结果，避免超时后产生未处理的异步异常。
+function promiseWithTimeout<T>(promise: Promise<T>, timeout: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    const timeoutId = setTimeout(() => {
+      if (settled) return
+      settled = true
+      reject(new Error(message))
+    }, timeout)
+
+    promise.then(
+      (value) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeoutId)
+        resolve(value)
+      },
+      (error) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeoutId)
+        reject(error)
+      },
+    )
+  })
 }
 
 type NavigatorWithUaData = Navigator & {
@@ -135,17 +164,6 @@ async function detectBrowserName(): Promise<string> {
 
   const navigatorWithUaData = navigator as NavigatorWithUaData
   const brands = navigatorWithUaData.userAgentData?.brands
-  const highEntropyValues = await navigatorWithUaData.userAgentData?.getHighEntropyValues?.([
-    'fullVersionList',
-  ]).catch(() => {
-    return null
-  })
-  const fullVersionList = highEntropyValues?.fullVersionList || []
-
-  const highEntropyName = browserNameFromBrands(fullVersionList)
-  if (highEntropyName) {
-    return highEntropyName
-  }
 
   if (brands && brands.length > 0) {
     const lowEntropyName = browserNameFromBrands(brands)
@@ -205,13 +223,23 @@ async function getExtensionIdentity(): Promise<ExtensionIdentity> {
 
   identityPromise = (async () => {
     const browser = await detectBrowserName()
-    const installId = await getInstallId().catch(() => {
-      // Storage can be unavailable briefly during startup. Fall back to the runtime scope so
-      // we still avoid the coarse browser-only key that causes cross-browser relay takeovers.
-      return tabSessionScope
-    })
+    const installId = await Promise.race([
+      getInstallId().catch(() => {
+        // Storage can be unavailable briefly during startup. Fall back to the runtime scope so
+        // we still avoid the coarse browser-only key that causes cross-browser relay takeovers.
+        return tabSessionScope
+      }),
+      // Chrome 153 can leave chrome.storage.local waiting forever during a profile startup.
+      // Identity must not block the relay connection in that case.
+      new Promise<string>((resolve) => setTimeout(() => resolve(tabSessionScope), 2000)),
+    ])
     try {
-      const info = await chrome.identity.getProfileUserInfo({ accountStatus: 'ANY' })
+      const info = await Promise.race([
+        chrome.identity.getProfileUserInfo({ accountStatus: 'ANY' }),
+        new Promise<chrome.identity.ProfileUserInfo>((_, reject) =>
+          setTimeout(() => reject(new Error('Chrome account identity lookup timed out')), 2000),
+        ),
+      ])
       return {
         browser,
         email: info.email || '',
@@ -284,6 +312,9 @@ function flushRecordingChunkBuffer(ws: WebSocket): void {
 class ConnectionManager {
   ws: WebSocket | null = null
   private connectionPromise: Promise<void> | null = null
+  private connectionAttemptId = 0
+  private keepAliveTimer: ReturnType<typeof setInterval> | null = null
+  private keepAliveSocket: WebSocket | null = null
   preserveTabsOnDetach = false
 
   async ensureConnection(): Promise<void> {
@@ -304,23 +335,38 @@ class ConnectionManager {
     // This protects against edge cases where individual timeouts don't fire
     // (e.g., DNS resolution hangs, AbortSignal doesn't work, etc.)
     const GLOBAL_TIMEOUT_MS = 15000
-    this.connectionPromise = Promise.race([
-      this.connect(),
+    const attemptId = ++this.connectionAttemptId
+    let timeoutId: ReturnType<typeof setTimeout> | undefined
+    const connectionPromise = Promise.race([
+      this.connect(attemptId),
       new Promise<never>((_, reject) => {
-        setTimeout(() => {
+        timeoutId = setTimeout(() => {
           reject(new Error('Connection timeout (global)'))
         }, GLOBAL_TIMEOUT_MS)
       }),
     ])
+    this.connectionPromise = connectionPromise
 
     try {
-      await this.connectionPromise
+      await connectionPromise
+    } catch (error) {
+      // Invalidate a timed-out attempt. connect() checks this generation before
+      // installing a late WebSocket, so an old attempt cannot replace a newer one.
+      if (this.connectionAttemptId === attemptId) {
+        this.connectionAttemptId++
+      }
+      throw error
     } finally {
-      this.connectionPromise = null
+      if (timeoutId) {
+        clearTimeout(timeoutId)
+      }
+      if (this.connectionPromise === connectionPromise) {
+        this.connectionPromise = null
+      }
     }
   }
 
-  private async connect(): Promise<void> {
+  private async connect(attemptId: number): Promise<void> {
     logger.debug(`Waiting for server at http://${RELAY_HOST}:${RELAY_PORT}...`)
 
     // Retry for up to 5 seconds with 1s intervals, then give up (maintain loop will retry later)
@@ -340,7 +386,15 @@ class ConnectionManager {
       }
     }
 
+    if (this.connectionAttemptId !== attemptId) {
+      throw new Error('Stale connection attempt')
+    }
+
     const identity = await getExtensionIdentity()
+    if (this.connectionAttemptId !== attemptId) {
+      throw new Error('Stale connection attempt')
+    }
+
     const relayUrl = new URL(`ws://${RELAY_HOST}:${RELAY_PORT}/extension`)
     if (identity.browser) {
       relayUrl.searchParams.set('browser', identity.browser)
@@ -406,7 +460,15 @@ class ConnectionManager {
       }
     })
 
+    if (this.connectionAttemptId !== attemptId) {
+      try {
+        socket.close()
+      } catch {}
+      throw new Error('Stale connection attempt')
+    }
+
     this.ws = socket
+    this.startKeepAlive(socket)
 
     this.ws.onmessage = async (event: MessageEvent) => {
       let message: any
@@ -549,7 +611,7 @@ class ConnectionManager {
     }
 
     this.ws.onclose = (event: CloseEvent) => {
-      this.handleClose(event.reason, event.code)
+      this.handleClose(event.reason, event.code, socket)
     }
 
     this.ws.onerror = (event: Event) => {
@@ -562,7 +624,49 @@ class ConnectionManager {
     logger.debug('Connection established')
   }
 
-  private handleClose(reason: string, code: number): void {
+  private startKeepAlive(socket: WebSocket): void {
+    this.stopKeepAlive()
+    this.keepAliveSocket = socket
+
+    const sendKeepAlive = () => {
+      if (this.ws !== socket || socket.readyState !== WebSocket.OPEN) {
+        this.stopKeepAlive(socket)
+        return
+      }
+      try {
+        // Chrome 116+ treats active WebSocket traffic as service-worker activity.
+        // The relay ignores this one-way ping; its own ping/pong remains unchanged.
+        socket.send(JSON.stringify({ method: 'ping' }))
+      } catch {
+        this.stopKeepAlive(socket)
+      }
+    }
+
+    sendKeepAlive()
+    this.keepAliveTimer = setInterval(sendKeepAlive, WEBSOCKET_KEEPALIVE_INTERVAL_MS)
+  }
+
+  private stopKeepAlive(socket?: WebSocket): void {
+    if (socket && this.keepAliveSocket !== socket) {
+      return
+    }
+    if (this.keepAliveTimer) {
+      clearInterval(this.keepAliveTimer)
+    }
+    this.keepAliveTimer = null
+    this.keepAliveSocket = null
+  }
+
+  private handleClose(reason: string, code: number, closedSocket?: WebSocket): void {
+    // A late close from an obsolete socket must not tear down the current socket.
+    if (closedSocket && this.ws !== closedSocket) {
+      logger.debug('Ignoring close from stale WebSocket')
+      return
+    }
+
+    this.connectionAttemptId++
+    this.stopKeepAlive(closedSocket)
+
     // Log memory at disconnect time to help diagnose memory-related terminations
     try {
       // @ts-ignore - performance.memory is Chrome-specific
@@ -850,6 +954,49 @@ export function sendMessage(message: any): void {
     } catch (error: any) {
       console.debug('ERROR sending message:', error, 'message type:', message.method || 'response')
     }
+  }
+}
+
+let relayKeepAliveDocumentCreating: Promise<void> | null = null
+
+// Keep a hidden extension document alive so Chrome does not tear down the MV3
+// service worker while the relay WebSocket is serving the current browser.
+async function ensureRelayKeepAliveDocument(): Promise<void> {
+  if (relayKeepAliveDocumentCreating) {
+    return relayKeepAliveDocumentCreating
+  }
+
+  relayKeepAliveDocumentCreating = (async () => {
+    const contexts = await promiseWithTimeout(
+      chrome.runtime.getContexts({
+        contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT],
+        documentUrls: [chrome.runtime.getURL('src/offscreen.html')],
+      }),
+      3000,
+      'Offscreen document lookup timed out after 3000ms',
+    )
+
+    if (contexts.length > 0) {
+      return
+    }
+
+    await promiseWithTimeout(
+      chrome.offscreen.createDocument({
+        url: 'src/offscreen.html',
+        reasons: [chrome.offscreen.Reason.WORKERS],
+        justification: 'Keep the local Playwriter relay available while the browser is open',
+      }),
+      5000,
+      'Offscreen document creation timed out after 5000ms',
+    )
+  })()
+
+  try {
+    await relayKeepAliveDocumentCreating
+  } catch (error: any) {
+    logger.debug('Could not create relay keepalive document:', error.message)
+  } finally {
+    relayKeepAliveDocumentCreating = null
   }
 }
 
@@ -1380,13 +1527,30 @@ async function attachTab(
   try {
     logger.debug('Attaching debugger to tab:', tabId)
 
+    // Chrome 153 can leave a restricted extension iframe in the page without
+    // returning the usual attach error. Remove those frames before the first
+    // debugger request so the request does not stall in the browser process.
+    try {
+      await promiseWithTimeout(
+        removeRestrictedIframes(tabId),
+        3000,
+        `Restricted iframe cleanup timed out after 3000ms for tab ${tabId}`,
+      )
+    } catch (cleanupError: any) {
+      logger.debug('Restricted iframe cleanup skipped:', cleanupError.message)
+    }
+
     // Bounded retry loop: chrome.debugger.attach fails if the tab contains chrome-extension://
     // iframes from other extensions. We remove them and retry, but aggressive extensions can
     // re-inject between cleanup and retry, so we allow up to 3 attempts.
     const maxAttachAttempts = 3
     for (let attempt = 1; attempt <= maxAttachAttempts; attempt++) {
       try {
-        await chrome.debugger.attach(debuggee, '1.3')
+        await promiseWithTimeout(
+          chrome.debugger.attach(debuggee, '1.3'),
+          10000,
+          `Debugger attach timed out after 10000ms for tab ${tabId}`,
+        )
         break
       } catch (attachError: any) {
         const msg = attachError.message ?? ''
@@ -1682,6 +1846,7 @@ async function connectTab(tabId: number): Promise<void> {
     const isWsError =
       error.message === 'Server not available' ||
       error.message === 'Connection timeout' ||
+      error.message === 'Connection timeout (global)' ||
       error.message.startsWith('WebSocket')
 
     if (isExtensionInUse) {
@@ -1786,15 +1951,6 @@ async function disconnectEverything(): Promise<void> {
   })
   await tabGroupQueue
   // WS connection is maintained - maintainConnection handles it
-}
-
-async function resetDebugger(): Promise<void> {
-  let targets = await chrome.debugger.getTargets()
-  targets = targets.filter((x) => x.tabId && x.attached)
-  logger.log(`found ${targets.length} existing debugger targets. detaching them before background script starts`)
-  for (const target of targets) {
-    await chrome.debugger.detach({ tabId: target.tabId })
-  }
 }
 
 // Our extension IDs - allow attaching to our own extension pages for debugging
@@ -2023,7 +2179,9 @@ async function onActionClicked(tab: chrome.tabs.Tab): Promise<void> {
   }
 }
 
-void resetDebugger()
+// Chrome 153 can leave debugger target cleanup in DETACH_STALLED_IN_STOPPING.
+// There are no Playwriter-owned targets to clean up on a fresh worker start;
+// attachTab() handles the active tab directly when the user requests it.
 void connectionManager.maintainLoop()
 
 chrome.contextMenus
@@ -2511,6 +2669,10 @@ function toastToolbar(tabId: number, msg: string): void {
 
 // Handle messages from content scripts (recorder commands) and offscreen document (recording chunks)
 chrome.runtime.onMessage.addListener((message, sender, _sendResponse) => {
+  if (message.action === 'playwriterKeepAlive') {
+    return false
+  }
+
   // Action recorder start/stop: routed through extension messaging to avoid CORS.
   // MAIN world toolbar → ISOLATED content script → here → relay HTTP endpoint.
   if (message.action === 'actionRecorderStart') {
@@ -2692,3 +2854,5 @@ chrome.webNavigation.onDOMContentLoaded.addListener((details) => {
       logger.debug('Could not re-inject toolbar after navigation:', err.message)
     })
 })
+
+void ensureRelayKeepAliveDocument()

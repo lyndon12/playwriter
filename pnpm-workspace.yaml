@@ -1,6 +1,6 @@
 packages:
-  - ./*
-  - playwright/packages/playwright-core
+  - code/*
+  - code/playwright/packages/playwright-core
 
 preferWorkspacePackages: true
 

@@ -51,6 +51,19 @@ import type {
   ChromeTabCaptureVideoConstraints,
 } from './offscreen-types'
 
+// MV3 service workers can be reclaimed while a WebSocket is still open on
+// Chrome profiles with a short extension-worker idle window. The offscreen
+// document is the long-lived context; these small local messages keep the
+// background worker available for debugger operations and relay events.
+const BACKGROUND_KEEPALIVE_INTERVAL_MS = 2000
+
+function notifyBackgroundKeepAlive(): void {
+  void chrome.runtime.sendMessage({ action: 'playwriterKeepAlive' }).catch(() => {})
+}
+
+notifyBackgroundKeepAlive()
+setInterval(notifyBackgroundKeepAlive, BACKGROUND_KEEPALIVE_INTERVAL_MS)
+
 interface OffscreenRecordingState {
   recorder: MediaRecorder
   stream: MediaStream

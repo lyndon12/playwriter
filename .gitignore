@@ -2,6 +2,7 @@ node_modules
 .vercel
 dist
 extension/dist*
+code/extension/dist*
 esm
 .DS_Store
 *.tsbuildinfo
@@ -12,12 +13,16 @@ coverage
 tmp
 playwriter/src/assets/*.png
 playwriter/src/assets/framer.html
+code/playwriter/src/assets/*.png
+code/playwriter/src/assets/framer.html
 *-snapshot.txt
 claude-extension
 
-# generated skill docs (source of truth: playwriter/src/skill.md)
+# generated skill docs (source of truth: code/playwriter/src/skill.md)
 website/public/SKILL.md
 website/public/.well-known/skills/playwriter/SKILL.md
+code/website/public/SKILL.md
+code/website/public/.well-known/skills/playwriter/SKILL.md
 
 # opensrc - source code for packages
 opensrc/
@@ -26,6 +31,9 @@ opensrc/
 playwriter/src/aria-snapshots/
 playwriter/src/snapshots/
 playwriter/src/__snapshots__/ax-debug/
+code/playwriter/src/aria-snapshots/
+code/playwriter/src/snapshots/
+code/playwriter/src/__snapshots__/ax-debug/
 gmail-oauth/
 .ck
 dist-release
